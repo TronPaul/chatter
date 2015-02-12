@@ -1,8 +1,11 @@
 (ns chatter.core
   (:require [markov-text.core :as mkt]
             [clojurewerkz.neocons.rest :as nr]
-            [clojure.java.io :as io]
-            [clojure.tools.cli :refer [parse-opts]])
+            [clojure.tools.cli :refer [parse-opts]]
+            [twitter-streaming-client.core :as client]
+            [twitter.oauth :as oauth]
+            [clojure.tools.logging :as log]
+            [twitter.api.streaming :as tas])
   (:gen-class))
 
 (def ngram-size 3)
@@ -11,25 +14,44 @@
   [uri]
   (nr/connect uri))
 
-(defn use-training-file
-  "Train the bot with a line separated training file"
-  [file conn]
-  (with-open [is (io/reader file)]
-    (doseq [line (line-seq is)]
-      (mkt/add-line line conn ngram-size))))
+(defn mentions-stream
+  [creds]
+  (client/create-twitter-stream tas/user-stream
+                                :oauth-creds creds :params {:with "user"}))
 
-(defn get-line
-  [conn]
-  (mkt/build-line conn))
+(defn- reply-to-mentions [mentions]
+  )
+
+(defn- handle-user-stream
+  [stream]
+  (let [mentions (:tweet stream)]
+    (reply-to-mentions mentions)
+    ))
 
 (def cli-opts
-  [["-c" "--connect" "neo4j REST URL"
-    :default "http://localhost:7474/db/data/"]])
+  [["-c" "--config" "config file"
+    :default "chatter-config.yml"]])
+
+(defn do-every
+  [ms callback]
+  (loop []
+    (do
+      (Thread/sleep ms)
+      (try (callback)
+           (catch Exception e (log/error e (str "caught exception: " (.getMessage e))))))
+    (recur)))
+
+(defn- read-config
+  [path]
+  {})
 
 (defn -main
-  "I don't do a whole lot ... yet."
+  "Run chatter"
   [& args]
-  (let [{:keys [options arguments]} (parse-opts args cli-opts)
-        conn (connect (:connect options))]
-    (use-training-file (first arguments) conn)
-    (println (get-line conn))))
+  (let [{:keys [options]} (parse-opts args cli-opts)
+        {:keys [ngram-size app-key app-secret user-token user-secret] :or {ngram-size 3}} (read-config (:config options))
+        creds (oauth/make-oauth-creds app-key app-secret user-token user-secret)
+        stream (mentions-stream creds)]
+    (client/start-twitter-stream stream)
+    (future (log/debug "STARTING USER STREAM")
+            (do-every 60500 #(handle-user-stream stream)))))
