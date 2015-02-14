@@ -1,32 +1,54 @@
 (ns chatter.core
-  (:require [markov-text.core :as mkt]
-            [clojurewerkz.neocons.rest :as nr]
-            [clojure.tools.cli :refer [parse-opts]]
+  (:use [twitter.oauth]
+        [twitter.callbacks]
+        [twitter.callbacks.handlers]
+        [twitter.api.restful]
+        [twitter.api.streaming])
+  (:require [clj-yaml.core :as yaml]
+            [clojure.tools.cli :as cli]
             [twitter-streaming-client.core :as client]
-            [twitter.oauth :as oauth]
-            [clojure.tools.logging :as log]
-            [twitter.api.streaming :as tas])
-  (:gen-class))
+            [clojure.java.io :as io]
+            [clojure.tools.logging :as log])
+  (:gen-class)
+  (:import (twitter.callbacks.protocols SyncSingleCallback)))
 
-(def ngram-size 3)
-
-(defn connect
-  [uri]
-  (nr/connect uri))
-
-(defn mentions-stream
+(defn- make-mentions-stream
   [creds]
-  (client/create-twitter-stream tas/user-stream
+  (client/create-twitter-stream user-stream
                                 :oauth-creds creds :params {:with "user"}))
 
-(defn- reply-to-mentions [mentions]
-  )
+(defn- irrelevant-mention?
+  [user-name tweet]
+  (or (empty? tweet)
+      (= (get-in tweet [:user :screen_name]) user-name)
+      (and (= (get-in tweet [:retweeted_status :user :screen_name]) user-name)
+           (.startsWith (get-in tweet [:retweeted_status :text]) "@"))))
 
-(defn- handle-user-stream
-  [stream]
-  (let [mentions (:tweet stream)]
-    (reply-to-mentions mentions)
-    ))
+(defn- make-reply
+  [text]
+  "Test reply. Please ignore Kappa")
+
+(defn reply-to-mention
+  [creds {:keys [text id] user-name :user/screen_name}]
+  (try
+    (statuses-update :oauth-creds creds
+                     :params {:status (str "@" name " " (make-reply text))
+                              :in_reply_to_status_id id}
+                     :callbacks (SyncSingleCallback. response-return-body
+                                                     response-throw-error
+                                                     exception-rethrow))
+    (catch Exception e
+      (log/error e (str "Could not reply to " user-name)))))
+
+(defn- reply-to-mentions
+  [creds user-name mentions]
+  (when-let [relevant-mentions (filter (complement (partial irrelevant-mention? user-name)) mentions)]
+    (doseq [rm relevant-mentions] (reply-to-mention creds rm))))
+
+(defn- handle-mentions-stream
+  [creds user-name mentions-stream]
+  (let [{mentions :tweet} (client/retrieve-queues mentions-stream)]
+    (reply-to-mentions creds user-name mentions)))
 
 (def cli-opts
   [["-c" "--config" "config file"
@@ -43,15 +65,19 @@
 
 (defn- read-config
   [path]
-  {})
+  (let [config-file (io/as-file path)]
+    (with-open [is (io/input-stream config-file)]
+      (yaml/parse-string is))))
 
 (defn -main
   "Run chatter"
   [& args]
-  (let [{:keys [options]} (parse-opts args cli-opts)
+  (let [{:keys [options]} (cli/parse-opts args cli-opts)
         {:keys [ngram-size app-key app-secret user-token user-secret] :or {ngram-size 3}} (read-config (:config options))
-        creds (oauth/make-oauth-creds app-key app-secret user-token user-secret)
-        stream (mentions-stream creds)]
-    (client/start-twitter-stream stream)
+        creds (make-oauth-creds app-key app-secret user-token user-secret)
+        mentions-stream (make-mentions-stream creds)
+        {user-name :screen_name} (:body (account-verify-credentials :oauth-creds creds))]
+    (log/info (str "Logged in as: " user-name))
+    (client/start-twitter-stream mentions-stream)
     (future (log/debug "STARTING USER STREAM")
-            (do-every 60500 #(handle-user-stream stream)))))
+            (do-every 60500 (partial handle-mentions-stream creds user-name mentions-stream)))))
